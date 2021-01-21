@@ -1,5 +1,5 @@
 /* HIT_START
- * BUILD: %t %s ../test_common.cpp
+ * BUILD: %t %s ../test_common.cpp EXCLUDE_HIP_PLATFORM vdi
  * TEST: %t
  * HIT_END
  */
@@ -90,6 +90,7 @@ int runTest(int argc, char** argv) {
             }
         }
     }
+    HIPCHECK(hipUnbindTexture(tex));
     hipFree(dData);
     hipFreeArray(hipArray);
     return testResult;

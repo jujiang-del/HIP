@@ -119,13 +119,13 @@ __global__ MyKernel(hipLaunchParm lp, float *A, float *B, float *C, size_t N)
 ...
 }
 
-MyKernel<<<dim3(gridDim), dim3(gridDim), 0, 0>>> (a,b,c,n);
+MyKernel<<<dim3(gridDim), dim3(groupDim), 0, 0>>> (a,b,c,n);
 // Alternatively, kernel can be launched by 
 // hipLaunchKernel(MyKernel, dim3(gridDim), dim3(groupDim), 0/*dynamicShared*/, 0/*stream), a, b, c, n);
 
 ```
 
-The hipLaunchKernel macro always starts with the five parameters specified above, followed by the kernel arguments. The Hipify script optionally converts Cuda launch syntax to hipLaunchKernel, including conversion of optional arguments in <<< >>> to the five required hipLaunchKernel parameters. The dim3 constructor accepts zero to three arguments and will by default initialize unspecified dimensions to 1. See [dim3](#dim3). The kernel uses the coordinate built-ins (hipThread*, hipBlock*, hipGrid*) to determine coordinate index and coordinate bounds of the work item that’s currently executing. See [Coordinate Built-Ins](#coordinate-builtins).
+The hipLaunchKernel macro always starts with the five parameters specified above, followed by the kernel arguments. HIPIFY tools optionally convert Cuda launch syntax to hipLaunchKernel, including conversion of optional arguments in <<< >>> to the five required hipLaunchKernel parameters. The dim3 constructor accepts zero to three arguments and will by default initialize unspecified dimensions to 1. See [dim3](#dim3). The kernel uses the coordinate built-ins (hipThread*, hipBlock*, hipGrid*) to determine coordinate index and coordinate bounds of the work item that’s currently executing. See [Coordinate Built-Ins](#coordinate-builtins).
 
 
 ## Kernel-Launch Example
@@ -153,7 +153,7 @@ void callMyKernel()
     unsigned N = 1000000;
     const unsigned blockSize = 256;
 
-    MyKernel<<<dim3(gridDim), dim3(gridDim), 0, 0>>> (a,b,c,n);
+    MyKernel<<<dim3(gridDim), dim3(groupDim), 0, 0>>> (a,b,c,n);
     // Alternatively, kernel can be launched by
     // hipLaunchKernel(MyKernel, dim3(N/blockSize), dim3(blockSize), 0, 0,  a,b,c,N);
 }
@@ -724,7 +724,7 @@ CUDA defines a __launch_bounds which is also designed to control occupancy:
 __launch_bounds(MAX_THREADS_PER_BLOCK, MIN_BLOCKS_PER_MULTIPROCESSOR)
 ```
 
-- The second parameter __launch_bounds parameters must be converted to the format used __hip_launch_bounds, which uses warps and execution-units rather than blocks and multi-processors  ( This conversion is performed automatically by the clang hipify tools.)
+- The second parameter __launch_bounds parameters must be converted to the format used __hip_launch_bounds, which uses warps and execution-units rather than blocks and multi-processors (this conversion is performed automatically by hipify tools).
 ```
 MIN_WARPS_PER_EXECUTION_UNIT = (MIN_BLOCKS_PER_MULTIPROCESSOR * MAX_THREADS_PER_BLOCK) / 32
 ```

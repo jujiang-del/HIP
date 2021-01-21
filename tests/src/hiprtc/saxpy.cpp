@@ -20,7 +20,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 */
 /* HIT_START
- * BUILD: %t %s ../test_common.cpp LINK_OPTIONS hiprtc EXCLUDE_HIP_PLATFORM all
+ * BUILD: %t %s ../test_common.cpp LINK_OPTIONS hiprtc EXCLUDE_HIP_PLATFORM nvcc vdi
  * TEST: %t
  * HIT_END
  */
@@ -35,6 +35,7 @@ THE SOFTWARE.
 #include <memory>
 #include <iostream>
 #include <iterator>
+#include <vector>
 
 static constexpr auto NUM_THREADS{128};
 static constexpr auto NUM_BLOCKS{32};
@@ -66,7 +67,16 @@ int main()
                         nullptr,    // headers
                         nullptr);   // includeNames
 
-    hiprtcResult compileResult{hiprtcCompileProgram(prog, 0, nullptr)};
+    hipDeviceProp_t props;
+    int device = 0;
+    hipGetDeviceProperties(&props, device);
+    std::string gfxName = "gfx" + std::to_string(props.gcnArch);
+    std::string sarg = "--gpu-architecture=" + gfxName;
+    const char* options[] = {
+        sarg.c_str()
+    };
+
+    hiprtcResult compileResult{hiprtcCompileProgram(prog, 1, options)};
 
     size_t logSize;
     hiprtcGetProgramLogSize(prog, &logSize);
@@ -133,7 +143,7 @@ int main()
     hipMemcpyDtoH(hOut.get(), dOut, bufferSize);
 
     for (size_t i = 0; i < n; ++i) {
-       if (a * hX[i] + hY[i] != hOut[i]) { failed("Validation failed."); }
+        if (fabs(a * hX[i] + hY[i] - hOut[i]) > fabs(hOut[i])* 1e-6) { failed("Validation failed."); }
     }
 
     hipFree(dX);

@@ -31,7 +31,7 @@ THE SOFTWARE.
 //-------------------------------------------------------------------------------------------------
 // Stream
 //
-#if defined(__HCC__) && (__hcc_minor__ < 3)
+#if defined(__HCC__) && (__hcc_major__ < 3) && (__hcc_minor__ < 3)
 enum queue_priority
 {
     priority_high = 0,
@@ -63,17 +63,17 @@ hipError_t ihipStreamCreate(TlsData *tls, hipStream_t* stream, unsigned int flag
 
             // TODO - se try-catch loop to detect memory exception?
             //
-            // Note this is an execute_any_order queue, 
+            // Note this is an execute_any_order queue,
             // CUDA stream behavior is that all kernels submitted will automatically
-            // wait for prev to complete, this behaviour will be mainatined by 
-            // hipModuleLaunchKernel. execute_any_order will help 
-	    // hipExtModuleLaunchKernel , which uses a special flag
+            // wait for prev to complete, this behaviour will be mainatined by
+            // hipModuleLaunchKernel. execute_any_order will help
+            // hipExtModuleLaunchKernel , which uses a special flag
 
             {
                 // Obtain mutex access to the device critical data, release by destructor
                 LockedAccessor_CtxCrit_t ctxCrit(ctx->criticalData());
 
-#if defined(__HCC__) && (__hcc_minor__ < 3)
+#if defined(__HCC__) && (__hcc_major__ < 3) && (__hcc_minor__ < 3)
                 auto istream = new ihipStream_t(ctx, acc.create_view(), flags);
 #else
                 auto istream = new ihipStream_t(ctx, acc.create_view(Kalmar::execute_any_order, Kalmar::queuing_mode_automatic, (Kalmar::queue_priority)priority), flags);
@@ -130,18 +130,19 @@ hipError_t hipDeviceGetStreamPriorityRange(int* leastPriority, int* greatestPrio
 hipError_t hipStreamWaitEvent(hipStream_t stream, hipEvent_t event, unsigned int flags) {
     HIP_INIT_SPECIAL_API(hipStreamWaitEvent, TRACE_SYNC, stream, event, flags);
 
-    hipError_t e = hipSuccess;
+    if (!event) return ihipLogStatus(hipErrorInvalidHandle);
 
-    if (event == nullptr) {
-        e = hipErrorInvalidResourceHandle;
-
-    } else {
-        auto ecd = event->locked_copyCrit(); 
+    auto ecd = event->locked_copyCrit();
+    if (event->_flags & hipEventInterprocess) {
+        // this is an IPC event
+        if (ecd._ipc_shmem->read_index >= 0) {
+            // we have at least one recorded event, so proceed
+            stream->locked_streamWaitEvent(ecd);
+        }
+    }
+    else {
         if ((ecd._state != hipEventStatusUnitialized) && (ecd._state != hipEventStatusCreated)) {
             if (HIP_SYNC_STREAM_WAIT || (HIP_SYNC_NULL_STREAM && (stream == 0))) {
-                // conservative wait on host for the specified event to complete:
-                // return _stream->locked_eventWaitComplete(this, waitMode);
-                //
                 ecd.marker().wait((event->_flags & hipEventBlockingSync) ? hc::hcWaitModeBlocked
                                                                          : hc::hcWaitModeActive);
             } else {
@@ -150,9 +151,9 @@ hipError_t hipStreamWaitEvent(hipStream_t stream, hipEvent_t event, unsigned int
                 stream->locked_streamWaitEvent(ecd);
             }
         }
-    }  // else event not recorded, return immediately and don't create marker.
+    }
 
-    return ihipLogStatus(e);
+    return ihipLogStatus(hipSuccess);
 };
 
 
@@ -189,7 +190,7 @@ hipError_t hipStreamSynchronize(hipStream_t stream) {
 
 //---
 /**
- * @return #hipSuccess, #hipErrorInvalidResourceHandle
+ * @return #hipSuccess, #hipErrorInvalidHandle
  */
 hipError_t hipStreamDestroy(hipStream_t stream) {
     HIP_INIT_API(hipStreamDestroy, stream);
@@ -199,7 +200,7 @@ hipError_t hipStreamDestroy(hipStream_t stream) {
     //--- Drain the stream:
     if (stream == NULL) {
         if (!HIP_FORCE_NULL_STREAM) {
-            e = hipErrorInvalidResourceHandle;
+            e = hipErrorInvalidHandle;
         }
     } else {
         stream->locked_wait();
@@ -210,7 +211,7 @@ hipError_t hipStreamDestroy(hipStream_t stream) {
             ctx->locked_removeStream(stream);
             delete stream;
         } else {
-            e = hipErrorInvalidResourceHandle;
+            e = hipErrorInvalidHandle;
         }
     }
 
@@ -225,7 +226,7 @@ hipError_t hipStreamGetFlags(hipStream_t stream, unsigned int* flags) {
     if (flags == NULL) {
         return ihipLogStatus(hipErrorInvalidValue);
     } else if (stream == hipStreamNull) {
-        return ihipLogStatus(hipErrorInvalidResourceHandle);
+        return ihipLogStatus(hipErrorInvalidHandle);
     } else {
         *flags = stream->_flags;
         return ihipLogStatus(hipSuccess);
@@ -240,9 +241,9 @@ hipError_t hipStreamGetPriority(hipStream_t stream, int* priority) {
     if (priority == NULL) {
         return ihipLogStatus(hipErrorInvalidValue);
     } else if (stream == hipStreamNull) {
-        return ihipLogStatus(hipErrorInvalidResourceHandle);
+        return ihipLogStatus(hipErrorInvalidHandle);
     } else {
-#if defined(__HCC__) && (__hcc_minor__ < 3)
+#if defined(__HCC__) && (__hcc_major__ < 3) && (__hcc_minor__ < 3)
         *priority = 0;
 #else
         LockedAccessor_StreamCrit_t crit(stream->criticalData());
@@ -257,11 +258,39 @@ hipError_t hipStreamGetPriority(hipStream_t stream, int* priority) {
 hipError_t hipStreamAddCallback(hipStream_t stream, hipStreamCallback_t callback, void* userData,
                                 unsigned int flags) {
     HIP_INIT_API(hipStreamAddCallback, stream, callback, userData, flags);
-    hipError_t e = hipSuccess;
 
-    // Create a thread in detached mode to handle callback
-    ihipStreamCallback_t* cb = new ihipStreamCallback_t(stream, callback, userData);
-    std::thread(ihipStreamCallbackHandler, cb).detach();
+    auto stream_original{stream};
+    stream = ihipSyncAndResolveStream(stream);
 
-    return ihipLogStatus(e);
+    if (!stream) return hipErrorInvalidValue;
+
+    LockedAccessor_StreamCrit_t cs{stream->criticalData()};
+
+    // create first marker
+    auto cf = cs->_av.create_marker(hc::no_scope);
+    // get its signal
+    auto signal = *reinterpret_cast<hsa_signal_t*>(cf.get_native_handle());
+    // increment its signal value
+    hsa_signal_add_relaxed(signal, 1);
+
+    // create callback that can be passed to hsa_amd_signal_async_handler
+    // this function will call the user's callback, then sets first packet's signal to 0 to indicate completion
+    auto t{new std::function<void()>{[=]() {
+        callback(stream_original, hipSuccess, userData);
+        hsa_signal_store_relaxed(signal, 0);
+    }}};
+
+    // register above callback with HSA runtime to be called when first packet's signal
+    // is decremented from 2 to 1 by CP (or it is already at 1)
+    hsa_amd_signal_async_handler(signal, HSA_SIGNAL_CONDITION_EQ, 1,
+        [](hsa_signal_value_t x, void* p) {
+            (*static_cast<decltype(t)>(p))();
+            delete static_cast<decltype(t)>(p);
+            return false;
+        }, t);
+
+    // create additional marker that blocks on the first one
+    cs->_av.create_blocking_marker(cf, hc::no_scope);
+
+    return ihipLogStatus(hipSuccess);
 }

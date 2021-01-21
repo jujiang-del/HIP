@@ -21,76 +21,101 @@ THE SOFTWARE.
 */
 
 /* HIT_START
- * BUILD: %t %s ../test_common.cpp EXCLUDE_HIP_PLATFORM nvcc
+ * BUILD: %t %s ../test_common.cpp EXCLUDE_HIP_PLATFORM nvcc hcc vdi
  * TEST: %t
  * HIT_END
  */
 
-#define CHECK(cmd) \
-{\
-    hipError_t error = cmd;\
-    if(error != hipSuccess) {\
-        fprintf(stderr, "error: '%s' (%d) at %s:%d\n", hipGetErrorString(error), error, __FILE__, __LINE__);\
-        exit(EXIT_FAILURE);\
-    }\
-}
-#include "hip/hip_runtime.h"
 #include "test_common.h"
-
 #define SIZE 10
-texture<float, hipTextureType1D, hipReadModeElementType> textureNormalizedVal_1D;
 
+static float getNormalizedValue(const float value,
+                                const hipChannelFormatDesc& desc) {
+    if ((desc.x == 8) && (desc.f == hipChannelFormatKindSigned))
+        return (value / SCHAR_MAX);
+    if ((desc.x == 8) && (desc.f == hipChannelFormatKindUnsigned))
+        return (value / UCHAR_MAX);
+    if ((desc.x == 16) && (desc.f == hipChannelFormatKindSigned))
+        return (value / SHRT_MAX);
+    if ((desc.x == 16) && (desc.f == hipChannelFormatKindUnsigned))
+        return (value / USHRT_MAX);
+    return value;
+}
+
+#if __HIP__
+__hip_pinned_shadow__
+#endif
+texture<char, hipTextureType1D, hipReadModeNormalizedFloat> texc;
+
+#if __HIP__
+__hip_pinned_shadow__
+#endif
+texture<unsigned char, hipTextureType1D, hipReadModeNormalizedFloat> texuc;
+
+#if __HIP__
+__hip_pinned_shadow__
+#endif
+texture<short, hipTextureType1D, hipReadModeNormalizedFloat> texs;
+
+#if __HIP__
+__hip_pinned_shadow__
+#endif
+texture<unsigned short, hipTextureType1D, hipReadModeNormalizedFloat> texus;
+
+
+template<typename T>
 __global__ void normalizedValTextureTest(unsigned int numElements, float* pDst)
 {
     unsigned int elementID = hipThreadIdx_x;
     if(elementID >= numElements)
-	    return;
-    float coord =(float) elementID/(numElements-1);
-    pDst[elementID] = tex1D(textureNormalizedVal_1D, coord);
+        return;
+    float coord =(float) elementID/numElements;
+    if(std::is_same<T, char>::value)
+        pDst[elementID] = tex1D(texc, coord);
+    else if(std::is_same<T, unsigned char>::value)
+        pDst[elementID] = tex1D(texuc, coord);
+    else if(std::is_same<T, short>::value)
+        pDst[elementID] = tex1D(texs, coord);
+    else if(std::is_same<T, unsigned short>::value)
+        pDst[elementID] = tex1D(texus, coord);
 }
 
 template<typename T>
-bool textureTest(enum hipArray_Format texFormat)
+bool textureTest(texture<T, hipTextureType1D, hipReadModeNormalizedFloat> *tex)
 {
-    T hData[] = {65, 66, 67, 68, 69, 70, 71, 72,73,74};
-    T *dData = NULL;
-    CHECK(hipMalloc((void **) &dData, sizeof(T)*SIZE));
-    CHECK(hipMemcpyHtoD((hipDeviceptr_t)dData, hData, sizeof(T)*SIZE));
-    
-    textureReference* texRef = &textureNormalizedVal_1D;
-    CHECK(hipTexRefSetAddressMode(texRef, 0, hipAddressModeClamp));
-    CHECK(hipTexRefSetAddressMode(texRef, 1, hipAddressModeClamp));
-    CHECK(hipTexRefSetFilterMode(texRef, hipFilterModePoint));
-    CHECK(hipTexRefSetFlags(texRef, HIP_TRSF_NORMALIZED_COORDINATES)); 
-    CHECK(hipTexRefSetFormat(texRef, texFormat, 1));
-    
-    HIP_ARRAY_DESCRIPTOR desc;
-    desc.Width = SIZE;
-    desc.Height = 1;
-    desc.Format = texFormat;
-    desc.NumChannels = 1;
-    CHECK(hipTexRefSetAddress2D(texRef, &desc, (hipDeviceptr_t)dData, sizeof(T)*SIZE));
-    
-    bool testResult = true;
+    hipChannelFormatDesc desc = hipCreateChannelDesc<T>();
+    hipArray_t dData;
+    HIPCHECK(hipMallocArray(&dData, &desc, SIZE, 1, hipArrayDefault));
+
+    T hData[] = {65, 66, 67, 68, 69, 70, 71, 72, 73, 74};
+    HIPCHECK(hipMemcpy2DToArray(dData, 0, 0, hData, sizeof(T)*SIZE, sizeof(T)*SIZE, 1, hipMemcpyHostToDevice));
+
+    tex->normalized = true;
+    tex->channelDesc = desc;
+    HIPCHECK(hipBindTextureToArray(tex, dData, &desc));
+
     float *dOutputData = NULL;
-    CHECK(hipMalloc((void **) &dOutputData, sizeof(float)*SIZE));
- 
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(normalizedValTextureTest), dim3(1,1,1), dim3(SIZE,1,1), 0, 0, SIZE, dOutputData);
+    HIPCHECK(hipMalloc((void **) &dOutputData, sizeof(float)*SIZE));
+
+    hipLaunchKernelGGL(normalizedValTextureTest<T>, dim3(1,1,1), dim3(SIZE,1,1), 0, 0, SIZE, dOutputData);
 
     float *hOutputData = new float[SIZE];
-    CHECK(hipMemcpyDtoH(hOutputData, (hipDeviceptr_t)dOutputData, (sizeof(float)*SIZE)));
-    
+    HIPCHECK(hipMemcpy(hOutputData, dOutputData, (sizeof(float)*SIZE), hipMemcpyDeviceToHost));
+
+    bool testResult = true;
     for(int i = 0; i < SIZE; i++)
     {
-    	if((float)hData[i]/texFormatToSize[texFormat] != hOutputData[i])
+        float expected = getNormalizedValue(float(hData[i]), desc);
+        if(expected != hOutputData[i])
         {
-	    printf("mismatch at index:%d for texType:%d output:%f\n",i,texFormat,hOutputData[i]);
+            printf("mismatch at index:%d output:%f expected:%f\n",i,hOutputData[i],expected);
             testResult = false;
-	    break;
+            break;
         }
     }
-    hipFree(dData);
-    hipFree(dOutputData);
+
+    HIPCHECK(hipFreeArray(dData));
+    HIPCHECK(hipFree(dOutputData));
     delete [] hOutputData;
     return testResult;
 }
@@ -99,20 +124,19 @@ int main(int argc, char** argv)
 {
     int device = 0;
     bool status = true;
-    CHECK(hipSetDevice(device));
+    HIPCHECK(hipSetDevice(device));
     hipDeviceProp_t props;
-    CHECK(hipGetDeviceProperties(&props, device));
+    HIPCHECK(hipGetDeviceProperties(&props, device));
     std::cout << "Device :: " << props.name << std::endl;
     #ifdef __HIP_PLATFORM_HCC__
     std::cout << "Arch - AMD GPU :: " << props.gcnArch << std::endl;
     #endif
     
-    status &= textureTest<char>          (HIP_AD_FORMAT_SIGNED_INT8);
-    status &= textureTest<unsigned char> (HIP_AD_FORMAT_UNSIGNED_INT8);
-    status &= textureTest<short>         (HIP_AD_FORMAT_SIGNED_INT16);
-    status &= textureTest<unsigned short>(HIP_AD_FORMAT_UNSIGNED_INT16);
-    status &= textureTest<float>         (HIP_AD_FORMAT_FLOAT);
-	
+    status &= textureTest<char>          (&texc);
+    status &= textureTest<unsigned char> (&texuc);
+    status &= textureTest<short>         (&texs);
+    status &= textureTest<unsigned short>(&texus);
+
     if(status){
         passed();
     }

@@ -49,7 +49,7 @@ THE SOFTWARE.
 #include <thread>
 #endif
 
-
+#include <hip/hip_version.h>
 #include <hip/hip_common.h>
 
 #if defined(__HIP_PLATFORM_HCC__) && !defined(__HIP_PLATFORM_NVCC__)
@@ -63,5 +63,6 @@ THE SOFTWARE.
 
 #include <hip/hip_runtime_api.h>
 #include <hip/hip_vector_types.h>
+#include <hip/library_types.h>
 
 #endif

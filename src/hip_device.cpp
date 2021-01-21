@@ -33,18 +33,16 @@ hipError_t hipGetDevice(int* deviceId) {
     HIP_INIT_API(hipGetDevice, deviceId);
 
     hipError_t e = hipSuccess;
+    if (deviceId == nullptr)
+        return ihipLogStatus(hipErrorInvalidValue);
 
     auto ctx = ihipGetTlsDefaultCtx();
 
-    if (deviceId != nullptr) {
-        if (ctx == nullptr) {
-            e = hipErrorInvalidDevice;  // TODO, check error code.
-            *deviceId = -1;
-        } else {
-            *deviceId = ctx->getDevice()->_deviceId;
-        }
+    if (ctx == nullptr) {
+        e = hipErrorInvalidDevice;  // TODO, check error code.
+        *deviceId = -1;
     } else {
-        e = hipErrorInvalidValue;
+        *deviceId = ctx->getDevice()->_deviceId;
     }
 
     return ihipLogStatus(e);
@@ -98,12 +96,13 @@ hipError_t hipDeviceGetLimit(size_t* pValue, hipLimit_t limit) {
     if (pValue == nullptr) {
         return ihipLogStatus(hipErrorInvalidValue);
     }
+#if __HIP_ENABLE_DEVICE_MALLOC__
     if (limit == hipLimitMallocHeapSize) {
         *pValue = (size_t)__HIP_SIZE_OF_HEAP;
         return ihipLogStatus(hipSuccess);
-    } else {
-        return ihipLogStatus(hipErrorUnsupportedLimit);
     }
+#endif
+    return ihipLogStatus(hipErrorUnsupportedLimit);
 }
 
 hipError_t hipFuncSetCacheConfig(const void* func, hipFuncCache_t cacheConfig) {
@@ -293,6 +292,7 @@ hipError_t ihipDeviceGetAttribute(int* pi, hipDeviceAttribute_t attr, int device
                 break;
             case hipDeviceAttributeMaxTexture3DDepth:
                 *pi = prop->maxTexture3D[2];
+                break;
             case hipDeviceAttributeHdpMemFlushCntl:
                 {
                     uint32_t** hdp = reinterpret_cast<uint32_t**>(pi);
@@ -311,12 +311,27 @@ hipError_t ihipDeviceGetAttribute(int* pi, hipDeviceAttribute_t attr, int device
             case hipDeviceAttributeCooperativeMultiDeviceLaunch:
                 *pi = prop->cooperativeMultiDeviceLaunch;
                 break;
+            case hipDeviceAttributeCooperativeMultiDeviceUnmatchedFunc:
+                *pi = prop->cooperativeMultiDeviceUnmatchedFunc;
+                break;
+            case hipDeviceAttributeCooperativeMultiDeviceUnmatchedGridDim:
+                *pi = prop->cooperativeMultiDeviceUnmatchedGridDim;
+                break;
+            case hipDeviceAttributeCooperativeMultiDeviceUnmatchedBlockDim:
+                *pi = prop->cooperativeMultiDeviceUnmatchedBlockDim;
+                break;
+            case hipDeviceAttributeCooperativeMultiDeviceUnmatchedSharedMem:
+                *pi = prop->cooperativeMultiDeviceUnmatchedSharedMem;
+                break;
             case hipDeviceAttributeMaxPitch:
                 *pi = prop->memPitch;
                 break;
-	    case hipDeviceAttributeTextureAlignment:
+            case hipDeviceAttributeTextureAlignment:
                 *pi = prop->textureAlignment;
                 break;
+            case hipDeviceAttributeTexturePitchAlignment:
+                *pi = prop->texturePitchAlignment;
+                 break;
             case hipDeviceAttributeKernelExecTimeout:
                 *pi = prop->kernelExecTimeoutEnabled;
                 break;

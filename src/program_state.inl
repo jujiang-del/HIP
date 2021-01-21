@@ -1,6 +1,6 @@
 #include "../include/hip/hcc_detail/program_state.hpp"
 
-#include "../include/hip/hcc_detail/code_object_bundle.hpp"
+#include "code_object_bundle.inl"
 #include "../include/hip/hcc_detail/hsa_helpers.hpp"
 
 #if !defined(__cpp_exceptions)
@@ -18,6 +18,9 @@
 #include <hsa/hsa_ext_amd.h>
 #include <hsa/hsa_ven_amd_loader.h>
 #include <amd_comgr.h>
+#include "hc.hpp"
+#include "hip_hcc_internal.h"
+#include "trace_helper.h"
 
 #include <link.h>
 
@@ -25,6 +28,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -89,9 +93,10 @@ struct Symbol {
 
 class Kernel_descriptor {
     std::uint64_t kernel_object_{};
-    amd_kernel_code_t const* kernel_header_{nullptr};
-    std::string name_{};
+    amd_kernel_code_t const* header_{};
+    std::string name_;
     std::vector<std::pair<std::size_t, std::size_t>> kernarg_layout_{};
+    bool is_code_object_v3_{};
 public:
     Kernel_descriptor() = default;
     Kernel_descriptor(
@@ -101,7 +106,8 @@ public:
         :
         kernel_object_{kernel_object},
         name_{name},
-        kernarg_layout_{std::move(kernarg_layout)}
+        kernarg_layout_{std::move(kernarg_layout)},
+        is_code_object_v3_{name.find(".kd") != std::string::npos}
     {
         bool supported{false};
         std::uint16_t min_v{UINT16_MAX};
@@ -123,7 +129,7 @@ public:
 
         r = tbl.hsa_ven_amd_loader_query_host_address(
             reinterpret_cast<void*>(kernel_object_),
-            reinterpret_cast<const void**>(&kernel_header_));
+            reinterpret_cast<const void**>(&header_));
 
         if (r != HSA_STATUS_SUCCESS) return;
     }
@@ -149,7 +155,7 @@ public:
             std::string,
                 std::unordered_map<
                     hsa_isa_t,
-                    std::vector<std::vector<char>>>>> code_object_blobs;
+                    std::vector<std::string>>>> code_object_blobs;
 
     std::pair<
         std::once_flag,
@@ -191,14 +197,15 @@ public:
     std::tuple<
         std::once_flag,
         std::mutex,
-        std::unordered_map<std::string, void*>> globals;
+        // map from string to pair<global_addr, pinned_addr>
+        std::unordered_map<std::string, std::pair<void*, void*>>> globals;
 
     using RAII_code_reader =
         std::unique_ptr<hsa_code_object_reader_t, 
                         std::function<void(hsa_code_object_reader_t*)>>;
     std::pair<
         std::mutex,
-        std::vector<RAII_code_reader>> code_readers;
+        std::deque<std::pair<std::string, RAII_code_reader>>> code_readers;
 
     program_state_impl() {
         // Create placeholder for each agent for the per-agent members.
@@ -213,7 +220,7 @@ public:
         std::string,
             std::unordered_map<
                 hsa_isa_t,
-                std::vector<std::vector<char>>>>& get_code_object_blobs() {
+                std::vector<std::string>>>& get_code_object_blobs() {
 
         std::call_once(code_object_blobs.first, [this]() {
             dl_iterate_phdr([](dl_phdr_info* info, std::size_t, void* p) {
@@ -240,7 +247,8 @@ public:
                     if (!valid(tmp)) break;
 
                     for (auto&& bundle : bundles(tmp)) {
-                        impl.code_object_blobs.second[elf][triple_to_hsa_isa(bundle.triple)].push_back(bundle.blob);
+                        if(bundle.blob.size())
+                            impl.code_object_blobs.second[elf][triple_to_hsa_isa(bundle.triple)].push_back(bundle.blob);
                     }
 
                     blob_it += tmp.bundled_code_size;
@@ -306,7 +314,7 @@ public:
         return symbol_addresses.second;
     }
 
-    std::unordered_map<std::string, void*>& get_globals() {
+    std::unordered_map<std::string, std::pair<void*, void*>>& get_globals() {
         std::call_once(std::get<0>(globals), [this]() { 
             std::get<2>(globals).reserve(get_symbol_addresses().size()); 
         });
@@ -347,39 +355,66 @@ public:
         auto& g_mutex = get_globals_mutex();
         for (auto&& x : undefined_symbols) {
 
-            if (g.find(x) != g.cend()) return;
-
             const auto it1 = get_symbol_addresses().find(x);
-
             if (it1 == get_symbol_addresses().cend()) {
-                hip_throw(std::runtime_error{
-                    "Global symbol: " + x + " is undefined."});
+                // For a unknown symbol, initialize it with a magic poison
+                hsa_executable_agent_global_variable_define(
+                    executable, agent, x.c_str(), 
+                    reinterpret_cast<void*>(0xDEADBEEFDEADBEEFull));
+                continue;
             }
 
-            std::lock_guard<std::mutex> lck{g_mutex};
+            hsa_status_t status;
+            auto check_hsa_global_var_define_error = [&x](hsa_status_t s) {
+                if (s != HSA_STATUS_SUCCESS) {
+                    const char* es;
+                    hsa_status_string(s, &es);
+                    hip_throw(std::runtime_error{ "Error when defining symbol " + x + " : " + es});
+                }
+            };
 
-            if (g.find(x) != g.cend()) return;
+            auto retrieve_pinned_address_from_cache = [](decltype(g) g, decltype(x) x) {
+                const auto& global_addr = g.find(x);
+                if (global_addr != g.cend()) {
+                    return global_addr->second.second;
+                }
+                return (void*)nullptr;
+            };
 
-            g.emplace(x, (void*)(it1->second.first));
-            void* p = nullptr;
-            hsa_amd_memory_lock(
-                reinterpret_cast<void*>(it1->second.first),
-                it1->second.second,
-                nullptr,  // All agents.
-                0,
-                &p);
-
-            hsa_executable_agent_global_variable_define(
-                executable, agent, x.c_str(), p);
+            void* p = retrieve_pinned_address_from_cache(g, x);
+            if (p == nullptr) {
+                std::lock_guard<std::mutex> lck{g_mutex};
+                p = retrieve_pinned_address_from_cache(g, x);
+                if (p == nullptr) {
+                    if (x == "_ZN2hc13printf_bufferE") {
+                        // This is the printf buffer, get the pinned address from HCC
+                        p = Kalmar::getContext()->getPrintfBufferPointerVA();
+                    } 
+                    else {
+                        status = hsa_amd_memory_lock(reinterpret_cast<void*>(it1->second.first),
+                                                     it1->second.second,
+                                                     nullptr,  // All agents.
+                                                     0, &p);
+                        check_hsa_global_var_define_error(status);
+                    }
+                    // cache the global address and its pinned address
+                    g.emplace(x, std::make_pair(reinterpret_cast<void*>(it1->second.first), p));
+                }
+            }
+            status = hsa_executable_agent_global_variable_define(
+                         executable, agent, x.c_str(), p);
+            check_hsa_global_var_define_error(status);
         }
     }
 
     void load_code_object_and_freeze_executable(
-        const std::string& file, hsa_agent_t agent, hsa_executable_t executable) {
+        const char* data,
+        const size_t data_size, bool make_copy,
+        hsa_agent_t agent, hsa_executable_t executable) {
         // TODO: the following sequence is inefficient, should be refactored
         //       into a single load of the file and subsequent ELFIO
         //       processing.
-        if (file.empty()) return;
+        if (!data_size) return;
 
         static const auto cor_deleter = [] (hsa_code_object_reader_t* p) {
             if (!p) return;
@@ -388,16 +423,39 @@ public:
         };
 
         RAII_code_reader tmp{new hsa_code_object_reader_t, cor_deleter};
-        hsa_code_object_reader_create_from_memory(
-            file.data(), file.size(), tmp.get());
 
-        hsa_executable_load_agent_code_object(
-            executable, agent, *tmp, nullptr, nullptr);
+        decltype(code_readers.second)::iterator it;
+        {
+          std::lock_guard<std::mutex> lck{code_readers.first};
 
-        hsa_executable_freeze(executable, nullptr);
+          std::string file;
+          if (make_copy)
+            file = std::string(data, data_size);
 
-        std::lock_guard<std::mutex> lck{code_readers.first};
-        code_readers.second.push_back(move(tmp));
+          code_readers.second.emplace_back(move(file), move(tmp));
+          it = std::prev(code_readers.second.end());
+
+          if (make_copy)
+            data = it->first.data();
+        }
+
+        auto check_hsa_error = [](hsa_status_t s) {
+            if (s != HSA_STATUS_SUCCESS) {
+                const char* hsa_err_msg;
+                hsa_status_string(s, &hsa_err_msg);
+                hip_throw(std::runtime_error{
+                              std::string("error when loading code object: ") +
+                              hsa_err_msg});
+            }
+        };
+
+        check_hsa_error(hsa_code_object_reader_create_from_memory(
+            data, data_size, it->second.get()));
+
+        check_hsa_error(hsa_executable_load_agent_code_object(
+            executable, agent, *it->second, nullptr, nullptr));
+
+        check_hsa_error(hsa_executable_freeze(executable, nullptr));
     }
 
 
@@ -439,7 +497,7 @@ public:
 
                             // TODO: this is massively inefficient and only meant for
                             // illustration.
-                            tmp = impl.load_executable(blob.data(), blob.size(), tmp, a);
+                            tmp = impl.load_executable(blob.data(), blob.size(), true, tmp, a);
 
                             if (tmp.handle) current_exes.push_back(tmp);
                         }
@@ -457,6 +515,7 @@ public:
     
     hsa_executable_t load_executable(const char* data,
                                      const size_t data_size,
+                                     bool make_copy,
                                      hsa_executable_t executable,
                                      hsa_agent_t agent) {
         ELFIO::elfio reader;
@@ -473,7 +532,7 @@ public:
                                                            code_object_dynsym,
                                                            agent, executable);
 
-        load_code_object_and_freeze_executable(ts, agent, executable);
+        load_code_object_and_freeze_executable(data, data_size, make_copy, agent, executable);
 
         return executable;
     }
@@ -576,12 +635,76 @@ public:
                 for (auto&& kernel_symbol : it->second) {
                     functions[aa].second.emplace(
                         function.first,
-                        Kernel_descriptor{kernel_object(kernel_symbol), it->first});
+                        Kernel_descriptor{kernel_object(kernel_symbol), it->first,
+                                          kernargs_size_align(function.first)});
                 }
             }
         }, agent);
 
         return functions[agent].second;
+    }
+
+    static
+    std::size_t parse_args_v2(
+            const std::string& metadata,
+            std::size_t f,
+            std::size_t l,
+            std::vector<std::pair<std::size_t, std::size_t>>& size_align) {
+        if (f == l) return f;
+        if (!size_align.empty()) return l;
+
+        do {
+            static constexpr size_t size_sz{5};
+            f = metadata.find("Size:", f) + size_sz;
+
+            if (l <= f) return f;
+
+            auto size = std::strtoul(&metadata[f], nullptr, 10);
+
+            static constexpr size_t align_sz{6};
+            f = metadata.find("Align:", f) + align_sz;
+
+            char* l{};
+            auto align = std::strtoul(&metadata[f], &l, 10);
+
+            f += (l - &metadata[f]) + 1;
+
+            size_align.emplace_back(size, align);
+        } while (true);
+    }
+
+    static
+    void read_kernarg_metadata_v2(
+        const std::string& kernels_md,
+        std::size_t dx,
+        std::unordered_map<
+            std::string,
+            std::vector<std::pair<std::size_t, std::size_t>>>& kernargs) {
+        do {
+            dx = kernels_md.find("Name:", dx);
+
+            if (dx == std::string::npos) break;
+
+            static constexpr decltype(kernels_md.size()) name_sz{5};
+            dx = kernels_md.find_first_not_of(" '", dx + name_sz);
+
+            auto fn =
+                kernels_md.substr(dx, kernels_md.find_first_of("'\n", dx) - dx);
+            dx += fn.size();
+
+            auto dx1 = kernels_md.find("CodeProps", dx);
+            dx = kernels_md.find("Args:", dx);
+
+            if (dx1 < dx || dx == std::string::npos) {
+                dx = dx1;
+                // create an empty kernarg laybout vector for kernels without any arg 
+                kernargs[fn];
+                continue;
+            }
+
+            static constexpr decltype(kernels_md.size()) args_sz{5};
+            dx = parse_args_v2(kernels_md, dx + args_sz, dx1, kernargs[fn]);
+        } while (true);
     }
 
     static
@@ -598,9 +721,8 @@ public:
     }
 
     static
-    void parse_args(
+    void parse_args_v3(
             const amd_comgr_metadata_node_t& args_md,
-            bool is_code_object_v3,
             std::vector<std::pair<std::size_t, std::size_t>>& size_align) {
         size_t arg_count = 0;
         if (amd_comgr_get_metadata_list_size(args_md, &arg_count)
@@ -614,10 +736,29 @@ public:
                 != AMD_COMGR_STATUS_SUCCESS)
                 return;
 
+            //Look up “.value_kind” to decide whether to ignore it
+            //See http://llvm.org/docs/AMDGPUUsage.html#code-object-v3-metadata-mattr-code-object-v3
+            amd_comgr_metadata_node_t arg_value_kind_md;
+            if (amd_comgr_metadata_lookup(arg_md, ".value_kind", &arg_value_kind_md)
+                != AMD_COMGR_STATUS_SUCCESS)
+                return;
+
+            std::string arg_value_kind{ metadata_to_string(arg_value_kind_md) };
+
+            if (amd_comgr_destroy_metadata(arg_value_kind_md)
+                != AMD_COMGR_STATUS_SUCCESS)
+                return;
+
+            if (arg_value_kind.find("hidden_") == 0) {
+                if (amd_comgr_destroy_metadata(arg_md)
+                    != AMD_COMGR_STATUS_SUCCESS)
+                    return;
+
+                continue; //Ignore hidden arg
+            }
+
             amd_comgr_metadata_node_t arg_size_md;
-            if (amd_comgr_metadata_lookup(arg_md,
-                                          is_code_object_v3 ? ".size" : "Size",
-                                          &arg_size_md)
+            if (amd_comgr_metadata_lookup(arg_md, ".size", &arg_size_md)
                 != AMD_COMGR_STATUS_SUCCESS)
                 return;
 
@@ -629,35 +770,21 @@ public:
 
             size_t arg_align;
 
-            if (is_code_object_v3) {
-                amd_comgr_metadata_node_t arg_offset_md;
-                if (amd_comgr_metadata_lookup(arg_md, ".offset", &arg_offset_md)
-                    != AMD_COMGR_STATUS_SUCCESS)
-                    return;
+            amd_comgr_metadata_node_t arg_offset_md;
+            if (amd_comgr_metadata_lookup(arg_md, ".offset", &arg_offset_md)
+                != AMD_COMGR_STATUS_SUCCESS)
+                return;
 
-                size_t arg_offset
-                    = std::stoul(metadata_to_string(arg_offset_md));
+            size_t arg_offset = std::stoul(metadata_to_string(arg_offset_md));
 
-                if (amd_comgr_destroy_metadata(arg_offset_md)
-                    != AMD_COMGR_STATUS_SUCCESS)
-                    return;
+            if (amd_comgr_destroy_metadata(arg_offset_md)
+                != AMD_COMGR_STATUS_SUCCESS)
+                return;
 
-                arg_align = 1;
-                while (arg_offset && (arg_offset & 1) == 0) {
-                    arg_offset >>= 1;
-                    arg_align <<= 1;
-                }
-            } else {
-                amd_comgr_metadata_node_t arg_align_md;
-                if (amd_comgr_metadata_lookup(arg_md, "Align", &arg_align_md)
-                    != AMD_COMGR_STATUS_SUCCESS)
-                    return;
-
-                arg_align = std::stoul(metadata_to_string(arg_align_md));
-
-                if (amd_comgr_destroy_metadata(arg_align_md)
-                    != AMD_COMGR_STATUS_SUCCESS)
-                    return;
+            arg_align = 1;
+            while (arg_offset && (arg_offset & 1) == 0) {
+                arg_offset >>= 1;
+                arg_align <<= 1;
             }
 
             size_align.emplace_back(arg_size, arg_align);
@@ -669,11 +796,11 @@ public:
     }
 
     static
-    void read_kernarg_metadata(
-            const std::vector<char>& blob,
+    void read_kernarg_metadata_v3(
+            const std::string& blob,
             std::unordered_map<
-            std::string,
-            std::vector<std::pair<std::size_t, std::size_t>>>& kernargs) {
+                std::string,
+                std::vector<std::pair<std::size_t, std::size_t>>>& kernargs) {
         amd_comgr_data_t dataIn;
         amd_comgr_status_t status;
 
@@ -690,7 +817,6 @@ public:
             != AMD_COMGR_STATUS_SUCCESS)
             return;
 
-        bool is_code_object_v3 = false;
         amd_comgr_metadata_node_t kernels_md;
         if (amd_comgr_metadata_lookup(metadata, "Kernels", &kernels_md)
             != AMD_COMGR_STATUS_SUCCESS) {
@@ -699,7 +825,6 @@ public:
                                           &kernels_md)
                 != AMD_COMGR_STATUS_SUCCESS)
                 return;
-            is_code_object_v3 = true;
         }
 
         size_t kernel_count = 0;
@@ -715,9 +840,7 @@ public:
                 continue;
 
             amd_comgr_metadata_node_t name_md;
-            if (amd_comgr_metadata_lookup(kernel_md,
-                                          is_code_object_v3 ? ".name" : "Name",
-                                          &name_md)
+            if (amd_comgr_metadata_lookup(kernel_md, ".name", &name_md)
                 != AMD_COMGR_STATUS_SUCCESS)
                 continue;
 
@@ -727,21 +850,15 @@ public:
                 != AMD_COMGR_STATUS_SUCCESS)
                 continue;
 
-            if (is_code_object_v3)
-                kernel_name_str.append(".kd");
-
-
             amd_comgr_metadata_node_t args_md;
-            if (amd_comgr_metadata_lookup(kernel_md,
-                                          is_code_object_v3 ? ".args" : "Args",
-                                          &args_md)
+            if (amd_comgr_metadata_lookup(kernel_md, ".args", &args_md)
                 != AMD_COMGR_STATUS_SUCCESS)
                 continue;
 
             auto foundKernel = kernargs.find(kernel_name_str);
             // parse arguments for a given kernel only once
             if (foundKernel == kernargs.end()) {
-                parse_args(args_md, is_code_object_v3, kernargs[kernel_name_str]);
+                parse_args_v3(args_md, kernargs[kernel_name_str]);
             }
 
             if (amd_comgr_destroy_metadata(args_md) != AMD_COMGR_STATUS_SUCCESS
@@ -757,7 +874,52 @@ public:
         amd_comgr_release_data(dataIn);
     }
 
-    const std::unordered_map<std::string, 
+    static
+    void read_kernarg_metadata(
+        const std::string& blob,
+        std::unordered_map<
+            std::string,
+            std::vector<std::pair<std::size_t, std::size_t>>>& kernargs)
+    {
+        std::istringstream istr{blob};
+        ELFIO::elfio reader;
+
+        if (!reader.load(istr)) return;
+
+        // TODO: this is inefficient.
+        auto it = find_section_if(reader, [](const ELFIO::section* x) {
+            return x->get_type() == SHT_NOTE;
+        });
+
+        if (!it) return;
+
+        const ELFIO::note_section_accessor acc{reader, it};
+        auto n{acc.get_notes_num()};
+        while (n--) {
+            ELFIO::Elf_Word type{};
+            std::string name{};
+            void* desc{};
+            ELFIO::Elf_Word desc_size{};
+
+            acc.get_note(n, type, name, desc, desc_size);
+
+            if (name == "AMDGPU") {
+                return read_kernarg_metadata_v3(blob, kernargs);
+            }
+            if (name != "AMD") continue; // TODO: switch to using NT_AMD_AMDGPU_HSA_METADATA.
+
+            std::string tmp{
+                static_cast<char*>(desc), static_cast<char*>(desc) + desc_size};
+
+            auto dx = tmp.find("Kernels:");
+
+            if (dx == std::string::npos) continue;
+
+            return read_kernarg_metadata_v2(tmp, dx + 8u, kernargs); // Skip "Kernels:".
+        }
+    }
+
+    const std::unordered_map<std::string,
         std::vector<std::pair<std::size_t, std::size_t>>>& get_kernargs() {
 
         std::call_once(kernargs.first, [this]() {
@@ -798,14 +960,16 @@ public:
 
         auto it0 = get_functions(agent).find(function_address);
 
-        if (it0 == get_functions(agent).cend()) {
-            hip_throw(std::runtime_error{
+        if (it0 != get_functions(agent).cend()) return it0->second;
+
+        // For hip-clang compiler + Hcc RT
+        hipFunction_t f = ihipGetDeviceFunction((const void*)function_address);
+        if (f) return reinterpret_cast<Kernel_descriptor&>(*f);
+
+        hip_throw(std::runtime_error{
                     "No device code available for function: " +
                     std::string(name(function_address)) +
                     ", for agent: " + name(agent)});
-        }
-
-        return it0->second;
     }
 
     const std::vector<std::pair<std::size_t, std::size_t>>& 

@@ -44,7 +44,7 @@ extern "C" __device__ __attribute__((const)) uint __ockl_mul24_u32(uint, uint);
 extern "C" __device__ __attribute__((const)) int __ockl_mul24_i32(int, int);
 extern "C" __device__ __attribute__((const)) uint __ockl_mul_hi_u32(uint, uint);
 extern "C" __device__ __attribute__((const)) int __ockl_mul_hi_i32(int, int);
-extern "C" __device__ __attribute__((const)) uint __ockl_sad_u32(uint, uint, uint);
+extern "C" __device__ __attribute__((const)) uint __ockl_sadd_u32(uint, uint, uint);
 
 extern "C" __device__ __attribute__((const)) uchar __ockl_clz_u8(uchar);
 extern "C" __device__ __attribute__((const)) ushort __ockl_clz_u16(ushort);
@@ -72,6 +72,7 @@ extern "C" __device__ __attribute__((const)) uint __ockl_multi_grid_thread_rank(
 extern "C" __device__ __attribute__((const)) int __ockl_multi_grid_is_valid(void);
 extern "C" __device__ __attribute__((convergent)) void __ockl_multi_grid_sync(void);
 
+extern "C" __device__ void __ockl_atomic_add_noret_f32(float*, float);
 
 // Introduce local address space
 #define __local __attribute__((address_space(3)))
@@ -80,7 +81,7 @@ extern "C" __device__ __attribute__((convergent)) void __ockl_multi_grid_sync(vo
 __device__ inline static __local void* __to_local(unsigned x) { return (__local void*)x; }
 #endif //__HIP_DEVICE_COMPILE__
 
-#if defined(__HCC__) && (__hcc_minor__ < 3)
+#if defined(__HCC__) && (__hcc_major__ < 3) && (__hcc_minor__ < 3)
 // __llvm_fence* functions from device-libs/irif/src/fence.ll
 extern "C" __device__ void __llvm_fence_acq_sg(void);
 extern "C" __device__ void __llvm_fence_acq_wg(void);

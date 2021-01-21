@@ -21,20 +21,21 @@ THE SOFTWARE.
 */
 
 /* HIT_START
- * BUILD: %t %s ../../test_common.cpp EXCLUDE_HIP_PLATFORM nvcc
+ * BUILD: %t %s ../../test_common.cpp EXCLUDE_HIP_PLATFORM nvcc vdi
  * TEST: %t
  * HIT_END
  */
 
 #include "hip/hip_runtime.h"
-//#include "hip/hip_runtime_api.h"
 #include <iostream>
 #include <fstream>
 #include <vector>
-//#include <hip/hip_hcc.h>
 
 #define fileName "tex2d_kernel.code"
 
+#if __HIP__
+__hip_pinned_shadow__
+#endif
 texture<float, 2, hipReadModeElementType> tex;
 bool testResult = false;
 

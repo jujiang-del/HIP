@@ -229,7 +229,7 @@ THE SOFTWARE.
             __host__ __device__
             operator __half_raw() const { return __half_raw{data}; }
             __host__ __device__
-            operator volatile __half_raw() const volatile
+            operator __half_raw() const volatile
             {
                 return __half_raw{data};
             }
@@ -1126,8 +1126,7 @@ THE SOFTWARE.
             {
                 auto r = static_cast<__half2_raw>(x).data ==
                     static_cast<__half2_raw>(y).data;
-                return __half2_raw{_Float16_2{
-                    static_cast<_Float16>(r.x), static_cast<_Float16>(r.y)}};
+                return __builtin_convertvector(-r, _Float16_2);
             }
             inline
             __device__
@@ -1135,8 +1134,7 @@ THE SOFTWARE.
             {
                 auto r = static_cast<__half2_raw>(x).data !=
                     static_cast<__half2_raw>(y).data;
-                return __half2_raw{_Float16_2{
-                    static_cast<_Float16>(r.x), static_cast<_Float16>(r.y)}};
+                return __builtin_convertvector(-r, _Float16_2);
             }
             inline
             __device__
@@ -1144,8 +1142,7 @@ THE SOFTWARE.
             {
                 auto r = static_cast<__half2_raw>(x).data <=
                     static_cast<__half2_raw>(y).data;
-                return __half2_raw{_Float16_2{
-                    static_cast<_Float16>(r.x), static_cast<_Float16>(r.y)}};
+                return __builtin_convertvector(-r, _Float16_2);
             }
             inline
             __device__
@@ -1153,8 +1150,7 @@ THE SOFTWARE.
             {
                 auto r = static_cast<__half2_raw>(x).data >=
                     static_cast<__half2_raw>(y).data;
-                return __half2_raw{_Float16_2{
-                    static_cast<_Float16>(r.x), static_cast<_Float16>(r.y)}};
+                return __builtin_convertvector(-r, _Float16_2);
             }
             inline
             __device__
@@ -1162,8 +1158,7 @@ THE SOFTWARE.
             {
                 auto r = static_cast<__half2_raw>(x).data <
                     static_cast<__half2_raw>(y).data;
-                return __half2_raw{_Float16_2{
-                    static_cast<_Float16>(r.x), static_cast<_Float16>(r.y)}};
+                return __builtin_convertvector(-r, _Float16_2);
             }
             inline
             __device__
@@ -1171,8 +1166,7 @@ THE SOFTWARE.
             {
                 auto r = static_cast<__half2_raw>(x).data >
                     static_cast<__half2_raw>(y).data;
-                return __half2_raw{_Float16_2{
-                    static_cast<_Float16>(r.x), static_cast<_Float16>(r.y)}};
+                return __builtin_convertvector(-r, _Float16_2);
             }
             inline
             __device__
@@ -1274,6 +1268,13 @@ THE SOFTWARE.
                     static_cast<__half_raw>(x).data +
                     static_cast<__half_raw>(y).data};
             }
+	    inline
+	    __device__
+	    __half __habs(__half x)
+	    {
+	        return __half_raw{
+		    __ocml_fabs_f16(static_cast<__half_raw>(x).data)};
+	    }
             inline
             __device__
             __half __hsub(__half x, __half y)
@@ -1340,6 +1341,13 @@ THE SOFTWARE.
                     static_cast<__half2_raw>(x).data +
                     static_cast<__half2_raw>(y).data};
             }
+	    inline
+	    __device__
+	    __half2 __habs2(__half2 x)
+	    {
+	        return __half2_raw{
+		    __ocml_fabs_2f16(static_cast<__half2_raw>(x).data)};
+	    }
             inline
             __device__
             __half2 __hsub2(__half2 x, __half2 y)

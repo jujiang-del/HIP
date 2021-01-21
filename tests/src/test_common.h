@@ -55,11 +55,15 @@ THE SOFTWARE.
     printf("%sPASSED!%s\n", KGRN, KNRM);                                                           \
     exit(0);
 
+// The real "assert" would have written to stderr. But it is
+// sufficient to just fflush here without getting pedantic. This also
+// ensures that we don't lose any earlier writes to stdout.
 #define failed(...)                                                                                \
     printf("%serror: ", KRED);                                                                     \
     printf(__VA_ARGS__);                                                                           \
     printf("\n");                                                                                  \
     printf("error: TEST FAILED\n%s", KNRM);                                                        \
+    fflush(NULL);                                                                               \
     abort();
 
 #define warn(...)                                                                                  \
@@ -99,10 +103,18 @@ THE SOFTWARE.
 
 #ifdef _WIN64
 #include <tchar.h>
-#define aligned_alloc _aligned_malloc
+#define aligned_alloc(x,y) _aligned_malloc(y,x)
+#define aligned_free(x) _aligned_free(x)
 #define popen(x,y) _popen(x,y)
 #define pclose(x) _pclose(x)
 #define setenv(x,y,z) _putenv_s(x,y)
+#define unsetenv _putenv
+#define fileno(x) _fileno(x)
+#define dup(x) _dup(x)
+#define dup2(x,y) _dup2(x,y)
+#define close(x) _close(x)
+#else
+#define aligned_free(x) free(x)
 #endif
 
 // standard command-line variables:
@@ -117,6 +129,10 @@ extern unsigned threadsPerBlock;
 extern int p_gpuDevice;
 extern unsigned p_verbose;
 extern int p_tests;
+extern const char* HIP_VISIBLE_DEVICES_STR;
+extern const char* CUDA_VISIBLE_DEVICES_STR;
+extern const char* PATH_SEPERATOR_STR;
+extern const char* NULL_DEVICE;
 
 // ********************* CPP section *********************
 #ifdef __cplusplus
@@ -149,6 +165,36 @@ int parseInt(const char* str, int* output);
 int parseStandardArguments(int argc, char* argv[], bool failOnUndefinedArg);
 
 unsigned setNumBlocks(unsigned blocksPerCU, unsigned threadsPerBlock, size_t N);
+
+template<typename T> // pointer type
+void checkArray(T hData, T hOutputData, size_t width, size_t height,size_t depth)
+{
+   for (int i = 0; i < depth; i++) {
+      for (int j = 0; j < height; j++) {
+          for (int k = 0; k < width; k++) {
+              int offset = i*width*height + j*width + k;
+              if (hData[offset] != hOutputData[offset]) {
+                  std::cerr << '[' << i << ',' << j << ',' << k << "]:" << hData[offset] << "----" << hOutputData[offset]<<"  ";
+                  failed("mistmatch at:%d %d %d",i,j,k);
+              }
+          }
+       }
+   }
+}
+
+template<typename T> 
+void checkArray(T input, T output, size_t height, size_t width)
+{
+    for(int i=0; i<height; i++ ){
+        for(int j=0; j<width; j++ ){
+            int offset = i*width + j;
+            if( input[offset] !=  output[offset] ){
+                 std::cerr << '[' << i << ',' << j << ',' << "]:" << input[offset] << "----" << output[offset]<<"  ";
+                 failed("mistmatch at:%d %d",i,j);
+            }
+        }
+    }
+}
 
 
 template <typename T>

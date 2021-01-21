@@ -33,7 +33,7 @@ THE SOFTWARE.
 #include "hip_prof_api.h"
 #include "hip_util.h"
 #include "env.h"
-
+#include <unordered_map>
 
 #if (__hcc_workweek__ < 16354)
 #error("This version of HIP requires a newer version of HCC.");
@@ -63,7 +63,6 @@ extern int HIP_LAUNCH_BLOCKING;
 extern int HIP_API_BLOCKING;
 
 extern int HIP_PRINT_ENV;
-extern int HIP_PROFILE_API;
 // extern int HIP_TRACE_API;
 extern int HIP_ATP;
 extern int HIP_DB;
@@ -90,6 +89,57 @@ extern int HIP_DUMP_CODE_OBJECT;
 
 // TODO - remove when this is standard behavior.
 extern int HCC_OPT_FLUSH;
+
+#define IMAGE_PITCH_ALIGNMENT 256
+template <typename T> inline T alignDown(T value, size_t alignment) {
+    return (T)(value & ~(alignment - 1));
+}
+
+template <typename T> inline T* alignDown(T* value, size_t alignment) {
+    return (T*)alignDown((intptr_t)value, alignment);
+}
+
+template <typename T> inline T alignUp(T value, size_t alignment) {
+    return alignDown((T)(value + alignment - 1), alignment);
+}
+
+template <typename T> inline T* alignUp(T* value, size_t alignment) {
+    return (T*)alignDown((intptr_t)(value + alignment - 1), alignment);
+}
+
+size_t getNumChannels(hsa_ext_image_channel_order_t channelOrder) {
+    switch (channelOrder) {
+      case HSA_EXT_IMAGE_CHANNEL_ORDER_RG:
+        return 2;
+      case HSA_EXT_IMAGE_CHANNEL_ORDER_RGB:
+        return 3;
+      case HSA_EXT_IMAGE_CHANNEL_ORDER_RGBA:
+        return 4;
+      case HSA_EXT_IMAGE_CHANNEL_ORDER_R:
+      default:
+        return 1;
+  }
+}
+
+size_t getElementSize(hsa_ext_image_channel_order_t channelOrder, hsa_ext_image_channel_type_t channelType) {
+    size_t bytesPerPixel = getNumChannels(channelOrder);
+    switch (channelType) {
+      case HSA_EXT_IMAGE_CHANNEL_TYPE_UNSIGNED_INT8:
+      case HSA_EXT_IMAGE_CHANNEL_TYPE_SIGNED_INT8:
+        break;
+
+      case HSA_EXT_IMAGE_CHANNEL_TYPE_SIGNED_INT32:
+      case HSA_EXT_IMAGE_CHANNEL_TYPE_UNSIGNED_INT32:
+      case HSA_EXT_IMAGE_CHANNEL_TYPE_FLOAT:
+        bytesPerPixel *= 4;
+        break;
+
+      default:
+        bytesPerPixel *= 2;
+        break;
+    }
+    return bytesPerPixel;
+}
 
 // Class to assign a short TID to each new thread, for HIP debugging purposes.
 class TidInfo {
@@ -199,34 +249,6 @@ extern const char* API_COLOR_END;
 // Must be enabled at runtime with HIP_TRACE_API
 #define COMPILE_HIP_TRACE_API 0x3
 
-
-// Compile code that generates trace markers for CodeXL ATP at HIP function begin/end.
-// ATP is standard CodeXL format that includes timestamps for kernels, HSA RT APIs, and HIP APIs.
-#ifndef COMPILE_HIP_ATP_MARKER
-#define COMPILE_HIP_ATP_MARKER 0
-#endif
-
-
-// Compile support for trace markers that are displayed on CodeXL GUI at start/stop of each function
-// boundary.
-// TODO - currently we print the trace message at the beginning. if we waited, we could also
-// tls->tidInfo return codes, and any values returned through ptr-to-args (ie the pointers allocated
-// by hipMalloc).
-#if COMPILE_HIP_ATP_MARKER
-#include "CXLActivityLogger.h"
-#define MARKER_BEGIN(markerName, group) amdtBeginMarker(markerName, group, nullptr);
-#define MARKER_END() amdtEndMarker();
-#define RESUME_PROFILING amdtResumeProfiling(AMDT_ALL_PROFILING);
-#define STOP_PROFILING amdtStopProfiling(AMDT_ALL_PROFILING);
-#else
-// Swallow scoped markers:
-#define MARKER_BEGIN(markerName, group)
-#define MARKER_END()
-#define RESUME_PROFILING
-#define STOP_PROFILING
-#endif
-
-
 //---
 // HIP Trace modes - use with HIP_TRACE_API=...
 #define TRACE_ALL 0    // 0x01
@@ -285,22 +307,17 @@ static inline uint64_t getTicks() { return hc::get_system_ticks(); }
 //---
 extern uint64_t recordApiTrace(TlsData *tls, std::string* fullStr, const std::string& apiStr);
 
-#if COMPILE_HIP_ATP_MARKER || (COMPILE_HIP_TRACE_API & 0x1)
+#if (COMPILE_HIP_TRACE_API & 0x1)
 #define API_TRACE(forceTrace, ...)                                                                 \
     GET_TLS();                                                                                     \
     uint64_t hipApiStartTick = 0;                                                                  \
     {                                                                                              \
         tls->tidInfo.incApiSeqNum();                                                               \
         if (forceTrace ||                                                                          \
-            (HIP_PROFILE_API || (COMPILE_HIP_DB && (HIP_TRACE_API & (1 << TRACE_ALL))))) {         \
+            (COMPILE_HIP_DB && (HIP_TRACE_API & (1 << TRACE_ALL)))) {         \
             std::string apiStr = std::string(__func__) + " (" + ToString(__VA_ARGS__) + ')';       \
             std::string fullStr;                                                                   \
             hipApiStartTick = recordApiTrace(tls, &fullStr, apiStr);                               \
-            if (HIP_PROFILE_API == 0x1) {                                                          \
-                MARKER_BEGIN(__func__, "HIP")                                                      \
-            } else if (HIP_PROFILE_API == 0x2) {                                                   \
-                MARKER_BEGIN(fullStr.c_str(), "HIP");                                              \
-            }                                                                                      \
         }                                                                                          \
     }
 
@@ -347,9 +364,6 @@ extern uint64_t recordApiTrace(TlsData *tls, std::string* fullStr, const std::st
                     tls->tidInfo.apiSeqNum(), __func__, localHipStatus,                               \
                     ihipErrorString(localHipStatus), ticks, API_COLOR_END);                           \
         }                                                                                             \
-        if (HIP_PROFILE_API) {                                                                        \
-            MARKER_END();                                                                             \
-        }                                                                                             \
         localHipStatus;                                                                               \
     })
 
@@ -375,18 +389,28 @@ const hipStream_t hipStreamNull = 0x0;
 
 
 /**
- * HIP IPC Handle Size
+ * HIP IPC Mem Handle Size
  */
-#define HIP_IPC_RESERVED_SIZE 24
+#define HIP_IPC_MEM_RESERVED_SIZE 24
 class ihipIpcMemHandle_t {
    public:
 #if USE_IPC
     hsa_amd_ipc_memory_t ipc_handle;  ///< ipc memory handle on ROCr
 #endif
     size_t psize;
-    char reserved[HIP_IPC_RESERVED_SIZE];
+    char reserved[HIP_IPC_MEM_RESERVED_SIZE];
 };
 
+/**
+ * HIP IPC Event Handle Size
+ */
+#define HIP_IPC_EVENT_RESERVED_SIZE 32
+class ihipIpcEventHandle_t {
+   public:
+#if USE_IPC
+    char shmem_name[HIP_IPC_HANDLE_SIZE];
+#endif
+};
 
 struct ihipModule_t {
     std::string fileName;
@@ -495,9 +519,10 @@ struct LockedBase {
 
 template <typename MUTEX_TYPE>
 class ihipStreamCriticalBase_t : public LockedBase<MUTEX_TYPE> {
-   public:
+public:
     ihipStreamCriticalBase_t(ihipStream_t* parentStream, hc::accelerator_view av)
-        : _av(av), _parent(parentStream){};
+        :  _parent{parentStream}, _av{av}, _last_op_was_a_copy{false}
+    {}
 
     ~ihipStreamCriticalBase_t() {}
 
@@ -519,12 +544,9 @@ class ihipStreamCriticalBase_t : public LockedBase<MUTEX_TYPE> {
         return gotLock ? this : nullptr;
     };
 
-   public:
     ihipStream_t* _parent;
-
     hc::accelerator_view _av;
-
-   private:
+    bool _last_op_was_a_copy;
 };
 
 
@@ -538,6 +560,20 @@ class ihipStreamCriticalBase_t : public LockedBase<MUTEX_TYPE> {
 
 typedef ihipStreamCriticalBase_t<StreamMutex> ihipStreamCritical_t;
 typedef LockedAccessor<ihipStreamCritical_t> LockedAccessor_StreamCrit_t;
+
+// do not change these two structs without changing the device library
+struct mg_sync {
+    uint w0;
+    uint w1;
+};
+
+struct mg_info {
+    struct mg_sync *mgs;
+    uint grid_id;
+    uint num_grids;
+    ulong prev_sum;
+    ulong all_sum;
+};
 
 //---
 // Internal stream structure.
@@ -572,7 +608,7 @@ class ihipStream_t {
     LockedAccessor_StreamCrit_t lockopen_preKernelCommand();
     void lockclose_postKernelCommand(const char* kernelName, hc::accelerator_view* av, bool unlockNotNeeded = 0);
 
-
+    void locked_wait(bool& waited);
     void locked_wait();
 
     hc::accelerator_view* locked_getAv() {
@@ -582,8 +618,6 @@ class ihipStream_t {
 
     void locked_streamWaitEvent(ihipEventData_t& event);
     hc::completion_future locked_recordEvent(hipEvent_t event);
-
-    bool locked_eventIsReady(hipEvent_t event);
 
     ihipStreamCritical_t& criticalData() { return _criticalData; };
 
@@ -608,6 +642,8 @@ class ihipStream_t {
 
     // Before calling this function, stream must be resolved from "0" to the actual stream:
     bool isDefaultStream() const { return _id == 0; };
+
+    std::vector<mg_info*>  coopMemsTracker;
 
    public:
     //---
@@ -645,19 +681,6 @@ class ihipStream_t {
 
 
 //----
-// Internal structure for stream callback handler
-class ihipStreamCallback_t {
-   public:
-    ihipStreamCallback_t(hipStream_t stream, hipStreamCallback_t callback, void* userData)
-        : _stream(stream), _callback(callback), _userData(userData) {
-    };
-    hipStream_t _stream;
-    hipStreamCallback_t _callback;
-    void* _userData;
-};
-
-
-//----
 // Internal event structure:
 enum hipEventStatus_t {
     hipEventStatusUnitialized = 0,  // event is uninitialized, must be "Created" before use.
@@ -673,6 +696,14 @@ enum ihipEventType_t {
     hipEventTypeStopCommand,
 };
 
+#define IPC_SIGNALS_PER_EVENT 32
+typedef struct ihipIpcEventShmem_s {
+    std::atomic<int> owners;
+    std::atomic<int> read_index;
+    std::atomic<int> write_index;
+    std::atomic<int> signal[IPC_SIGNALS_PER_EVENT];
+} ihipIpcEventShmem_t;
+
 
 struct ihipEventData_t {
     ihipEventData_t() {
@@ -680,18 +711,24 @@ struct ihipEventData_t {
         _stream = NULL;
         _timestamp = 0;
         _type = hipEventTypeIndependent;
+        _ipc_name = "";
+        _ipc_fd = 0;
+        _ipc_shmem = NULL;
     };
 
-    void marker(const hc::completion_future& marker) { _marker = marker; };
+    void marker(const hc::completion_future& marker) { _marker = marker; }
     hc::completion_future& marker() { return _marker; }
-    uint64_t timestamp() const { return _timestamp; };
-    ihipEventType_t type() const { return _type; };
+    uint64_t timestamp() const { return _timestamp; }
+    ihipEventType_t type() const { return _type; }
 
     ihipEventType_t _type;
     hipEventStatus_t _state;
     hipStream_t _stream;  // Stream where the event is recorded.  Null stream is resolved to actual
                           // stream when recorded
     uint64_t _timestamp;  // store timestamp, may be set on host or by marker.
+    std::string _ipc_name;
+    int _ipc_fd;
+    ihipIpcEventShmem_t *_ipc_shmem;
    private:
     hc::completion_future _marker;
 };
@@ -703,7 +740,7 @@ template <typename MUTEX_TYPE>
 class ihipEventCriticalBase_t : LockedBase<MUTEX_TYPE> {
    public:
     explicit ihipEventCriticalBase_t(const ihipEvent_t* parentEvent) : _parent(parentEvent) {}
-    ~ihipEventCriticalBase_t(){};
+    ~ihipEventCriticalBase_t() {}
 
     // Keep data in structure so it can be easily copied into snapshots
     // (used to reduce lock contention and preserve correct lock order)
@@ -724,8 +761,6 @@ class ihipEvent_t {
     explicit ihipEvent_t(unsigned flags);
     void attachToCompletionFuture(const hc::completion_future* cf, hipStream_t stream,
                                   ihipEventType_t eventType);
-    std::pair<hipEventStatus_t, uint64_t> refreshEventStatus();  // returns pair <state, timestamp>
-
 
     // Return a copy of the critical state. The critical data is locked during the copy.
     ihipEventData_t locked_copyCrit() {
@@ -737,6 +772,7 @@ class ihipEvent_t {
 
    public:
     unsigned _flags;
+    int _deviceId;
 
    private:
     ihipEventCritical_t _criticalData;
@@ -972,7 +1008,18 @@ hipError_t hipModuleGetFunctionEx(hipFunction_t* hfunc, hipModule_t hmod,
 
 hipStream_t ihipSyncAndResolveStream(hipStream_t, bool lockAcquired = 0);
 hipError_t ihipStreamSynchronize(TlsData *tls, hipStream_t stream);
-void ihipStreamCallbackHandler(ihipStreamCallback_t* cb);
+
+/**
+ * @brief Copies the memory address and size of symbol @p symbolName
+ *
+ * @param[in]  symbolName - Symbol on device
+ * @param[out] devPtr - Pointer to a pointer to the memory referred to by the symbol
+ * @param[out] size - Pointer to the size of the symbol
+ * @return #hipSuccess, #hipErrorNotInitialized, #hipErrorNotFound, #hipErrorInvalidValue
+ *
+ */
+hipError_t ihipGetGlobalVar(hipDeviceptr_t* dev_ptr, size_t* size_ptr, const char* hostVar,
+                            hipModule_t hmod = nullptr);
 
 // Stream printf functions:
 inline std::ostream& operator<<(std::ostream& os, const ihipStream_t& s) {
@@ -1022,7 +1069,14 @@ inline std::ostream& operator<<(std::ostream& os, const ihipCtx_t* c) {
 namespace hip_internal {
 hipError_t memcpyAsync(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind,
                        hipStream_t stream);
+
+hipError_t ihipHostMalloc(TlsData *tls, void** ptr, size_t sizeBytes, unsigned int flags, bool noSync = 0);
+
+hipError_t ihipHostFree(TlsData *tls, void* ptr);
+
 };
+
+#define MAX_COOPERATIVE_GPUs 255
 
 //---
 // TODO - review the context creation strategy here.  Really should be:
@@ -1037,5 +1091,15 @@ static inline ihipCtx_t* iihipGetTlsDefaultCtx(TlsData* tls) {
     }
     return tls->defaultCtx;
 }
+
+/**
+ *  @brief Get device function from host kernel function pointer
+ *  Needed only for clang + HIP-HCC RT
+ *
+ *  @param [in] hostFunction host kernel function pointer
+ *
+ *  @returns hipFuntion_t, nullptr
+ */
+hipFunction_t ihipGetDeviceFunction(const void *hostFunction);
 
 #endif
